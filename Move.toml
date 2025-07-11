@@ -1,0 +1,16 @@
+[package]
+name = "FlowStream"
+version = "1.0.0"
+authors = []
+
+[addresses]
+addr ="f48e1cc8eb3006a5e6040777a72c8f813ca62340e0bb4b15b7930c647f0aa246"
+
+[dev-addresses]
+
+[dependencies.AptosFramework]
+git = "https://github.com/aptos-labs/aptos-framework.git"
+rev = "mainnet"
+subdir = "aptos-framework"
+
+[dev-dependencies]
