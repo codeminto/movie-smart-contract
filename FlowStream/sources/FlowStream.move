@@ -7,8 +7,6 @@ module addr::FlowStream{
     use std::string::String;
     use aptos_framework::timestamp;
     use aptos_framework::coin::{Self, Coin};
-    use aptos_framework::account;
-    use aptos_framework::object::{Self, Object};
     use aptos_std::table::{Self, Table};
     use aptos_std::type_info;
 
