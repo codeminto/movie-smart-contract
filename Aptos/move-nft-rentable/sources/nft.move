@@ -1,533 +1,443 @@
-module rentable::market {
-    use sui::object::{Self, UID, ID};
-    use sui::tx_context::{Self, TxContext};
-    use sui::transfer;
-    use sui::coin::{Self, Coin};
-    use sui::sui::SUI;
-    use sui::clock::{Self, Clock};
-    use sui::table::{Self, Table};
-    use sui::event;
-    use sui::balance::{Self, Balance};
-    use sui::pay;
-    use std::option::{Self, Option};
+module addr::market {
+    use std::signer;
     use std::vector;
+    use std::string::{Self, String};
+    use std::option::{Self, Option};
+    use std::timestamp;
+    use std::coin;
+    use std::table::{Self, Table};
+    use std::event;
+    use aptos_framework::account;
+    use aptos_framework::aptos_coin::AptosCoin;
+    use aptos_std::math64;
 
     // Error codes
-    const E_NOT_OWNER: u64 = 1;
-    const E_INVALID_DURATION: u64 = 2;
-    const E_INVALID_PRICE: u64 = 3;
-    const E_LISTING_NOT_FOUND: u64 = 4;
-    const E_INSUFFICIENT_PAYMENT: u64 = 5;
-    const E_RENTAL_EXPIRED: u64 = 6;
-    const E_RENTAL_NOT_EXPIRED: u64 = 7;
-    const E_UNAUTHORIZED: u64 = 8;
-    const E_ALREADY_RENTED: u64 = 9;
-    const E_INVALID_COLLATERAL: u64 = 10;
+    const E_NOT_INITIALIZED: u64 = 1;
+    const E_ALREADY_INITIALIZED: u64 = 2;
+    const E_NOT_OWNER: u64 = 3;
+    const E_INVALID_PRICE: u64 = 4;
+    const E_INVALID_DURATION: u64 = 5;
+    const E_LISTING_NOT_FOUND: u64 = 6;
+    const E_ALREADY_RENTED: u64 = 7;
+    const E_INSUFFICIENT_PAYMENT: u64 = 8;
+    const E_RENTAL_EXPIRED: u64 = 9;
+    const E_RENTAL_NOT_FOUND: u64 = 10;
+    const E_NOT_RENTER: u64 = 11;
+    const E_CANNOT_RENT_OWN_NFT: u64 = 12;
+    const E_INVALID_COLLATERAL: u64 = 13;
+    const E_PAUSED: u64 = 14;
+    const E_UNAUTHORIZED: u64 = 15;
 
     // Constants
-    const PLATFORM_FEE_BPS: u64 = 250; // 2.5%
-    const DAY_IN_MS: u64 = 86400000; // 24 hours in milliseconds
+    const SECONDS_PER_DAY: u64 = 86400;
+    const PLATFORM_FEE_BASIS_POINTS: u64 = 250; // 2.5%
+    const MAX_DURATION_DAYS: u64 = 365;
 
-    // Core structures
-    struct Marketplace has key {
-        id: UID,
-        listings: Table<ID, Listing>,
-        platform_balance: Balance<SUI>,
-        admin: address,
-        paused: bool,
-        platform_fee_bps: u64,
-    }
-
+    // Core structs
     struct Listing has store {
         owner: address,
-        nft_id: ID,
+        nft_id: String,
         price_per_day: u64,
-        max_duration: u64,
+        max_duration_days: u64,
         collateral_required: u64,
-        is_rented: bool,
-        renter: Option<address>,
-        rental_start: Option<u64>,
-        rental_end: Option<u64>,
+        is_active: bool,
+        created_at: u64,
     }
 
-    struct RentalNFT<T: key + store> has key {
-        id: UID,
-        original_nft: T,
-        original_id: ID,
-        expires_at: u64,
+    struct RentalRecord has store {
         renter: address,
-        listing_id: ID,
+        original_owner: address,
+        nft_id: String,
+        rental_start: u64,
+        rental_end: u64,
+        daily_price: u64,
+        total_paid: u64,
+        collateral_paid: u64,
+        is_active: bool,
     }
 
-    struct AdminCap has key {
-        id: UID,
+    struct RentalCapability has key, store {
+        nft_id: String,
+        expires_at: u64,
+        original_owner: address,
+    }
+
+    struct MarketplaceConfig has key {
+        admin: address,
+        is_paused: bool,
+        platform_fee_basis_points: u64,
+        treasury: address,
+    }
+
+    struct MarketplaceData has key {
+        listings: Table<String, Listing>,
+        rentals: Table<String, RentalRecord>,
+        user_rentals: Table<address, vector<String>>,
+        listing_counter: u64,
     }
 
     // Events
-    struct Listed has copy, drop {
-        listing_id: ID,
+    #[event]
+    struct ListedEvent has drop, store {
         owner: address,
-        nft_id: ID,
+        nft_id: String,
         price_per_day: u64,
-        max_duration: u64,
+        max_duration_days: u64,
         collateral_required: u64,
+        timestamp: u64,
     }
 
-    struct Rented has copy, drop {
-        listing_id: ID,
+    #[event]
+    struct RentedEvent has drop, store {
         renter: address,
-        nft_id: ID,
+        owner: address,
+        nft_id: String,
+        rental_duration_days: u64,
+        total_cost: u64,
+        collateral: u64,
         rental_start: u64,
         rental_end: u64,
-        total_paid: u64,
     }
 
-    struct Returned has copy, drop {
-        listing_id: ID,
+    #[event]
+    struct ReturnedEvent has drop, store {
         renter: address,
-        nft_id: ID,
+        owner: address,
+        nft_id: String,
+        return_time: u64,
         refund_amount: u64,
-        early_return: bool,
+        collateral_returned: u64,
     }
 
-    struct ExpiredAutoReturn has copy, drop {
-        listing_id: ID,
-        original_owner: address,
-        nft_id: ID,
+    #[event]
+    struct ExpiredAutoReturnEvent has drop, store {
+        renter: address,
+        owner: address,
+        nft_id: String,
+        expiry_time: u64,
     }
 
     // Initialize the marketplace
-    fun init(ctx: &mut TxContext) {
-        let admin_cap = AdminCap {
-            id: object::new(ctx),
-        };
+    public entry fun initialize(admin: &signer, treasury: address) {
+        let admin_addr = signer::address_of(admin);
+        assert!(!exists<MarketplaceConfig>(admin_addr), E_ALREADY_INITIALIZED);
 
-        let marketplace = Marketplace {
-            id: object::new(ctx),
-            listings: table::new(ctx),
-            platform_balance: balance::zero(),
-            admin: tx_context::sender(ctx),
-            paused: false,
-            platform_fee_bps: PLATFORM_FEE_BPS,
-        };
-
-        transfer::share_object(marketplace);
-        transfer::transfer(admin_cap, tx_context::sender(ctx));
-    }
-
-    // List NFT for rent
-    public entry fun list_for_rent<T: key + store>(
-        marketplace: &mut Marketplace,
-        nft: T,
-        price_per_day: u64,
-        max_duration: u64,
-        collateral_required: u64,
-        ctx: &mut TxContext
-    ) {
-        assert!(!marketplace.paused, E_UNAUTHORIZED);
-        assert!(price_per_day > 0, E_INVALID_PRICE);
-        assert!(max_duration > 0, E_INVALID_DURATION);
-
-        let nft_id = object::id(&nft);
-        let listing_id = object::id_from_address(tx_context::fresh_object_address(ctx));
-
-        let listing = Listing {
-            owner: tx_context::sender(ctx),
-            nft_id,
-            price_per_day,
-            max_duration,
-            collateral_required,
-            is_rented: false,
-            renter: option::none(),
-            rental_start: option::none(),
-            rental_end: option::none(),
-        };
-
-        table::add(&mut marketplace.listings, listing_id, listing);
-        
-        // Transfer NFT to marketplace for safekeeping
-        transfer::public_transfer(nft, object::uid_to_address(&marketplace.id));
-
-        event::emit(Listed {
-            listing_id,
-            owner: tx_context::sender(ctx),
-            nft_id,
-            price_per_day,
-            max_duration,
-            collateral_required,
-        });
-    }
-
-    // Rent NFT
-    public entry fun rent<T: key + store>(
-        marketplace: &mut Marketplace,
-        listing_id: ID,
-        nft: T,
-        duration_days: u64,
-        payment: Coin<SUI>,
-        collateral: Option<Coin<SUI>>,
-        clock: &Clock,
-        ctx: &mut TxContext
-    ) {
-        assert!(!marketplace.paused, E_UNAUTHORIZED);
-        assert!(table::contains(&marketplace.listings, listing_id), E_LISTING_NOT_FOUND);
-        
-        let listing = table::borrow_mut(&mut marketplace.listings, listing_id);
-        assert!(!listing.is_rented, E_ALREADY_RENTED);
-        assert!(duration_days > 0 && duration_days <= listing.max_duration, E_INVALID_DURATION);
-
-        let current_time = clock::timestamp_ms(clock);
-        let rental_end = current_time + (duration_days * DAY_IN_MS);
-        let total_cost = listing.price_per_day * duration_days;
-        let platform_fee = (total_cost * marketplace.platform_fee_bps) / 10000;
-        let owner_payment = total_cost - platform_fee;
-
-        assert!(coin::value(&payment) >= total_cost, E_INSUFFICIENT_PAYMENT);
-
-        // Handle collateral if required
-        if (listing.collateral_required > 0) {
-            assert!(option::is_some(&collateral), E_INVALID_COLLATERAL);
-            let collateral_coin = option::extract(&mut collateral);
-            assert!(coin::value(&collateral_coin) >= listing.collateral_required, E_INVALID_COLLATERAL);
-            // Hold collateral (simplified - in practice, store in escrow)
-            transfer::public_transfer(collateral_coin, object::uid_to_address(&marketplace.id));
-        };
-
-        // Process payment
-        let payment_balance = coin::into_balance(payment);
-        let platform_fee_balance = balance::split(&mut payment_balance, platform_fee);
-        balance::join(&mut marketplace.platform_balance, platform_fee_balance);
-
-        // Pay owner
-        let owner_payment_coin = coin::from_balance(payment_balance, ctx);
-        transfer::public_transfer(owner_payment_coin, listing.owner);
-
-        // Update listing
-        listing.is_rented = true;
-        listing.renter = option::some(tx_context::sender(ctx));
-        listing.rental_start = option::some(current_time);
-        listing.rental_end = option::some(rental_end);
-
-        // Create rental NFT wrapper
-        let rental_nft = RentalNFT {
-            id: object::new(ctx),
-            original_nft: nft,
-            original_id: object::id(&nft),
-            expires_at: rental_end,
-            renter: tx_context::sender(ctx),
-            listing_id,
-        };
-
-        let rental_id = object::id(&rental_nft);
-        transfer::transfer(rental_nft, tx_context::sender(ctx));
-
-        event::emit(Rented {
-            listing_id,
-            renter: tx_context::sender(ctx),
-            nft_id: object::id(&nft),
-            rental_start: current_time,
-            rental_end,
-            total_paid: total_cost,
+        move_to(admin, MarketplaceConfig {
+            admin: admin_addr,
+            is_paused: false,
+            platform_fee_basis_points: PLATFORM_FEE_BASIS_POINTS,
+            treasury,
         });
 
-        // Clean up empty collateral option
-        option::destroy_none(collateral);
-    }
-
-    // Return NFT early
-    public entry fun return_early<T: key + store>(
-        marketplace: &mut Marketplace,
-        rental_nft: RentalNFT<T>,
-        clock: &Clock,
-        ctx: &mut TxContext
-    ) {
-        let RentalNFT {
-            id,
-            original_nft,
-            original_id,
-            expires_at,
-            renter,
-            listing_id,
-        } = rental_nft;
-
-        assert!(renter == tx_context::sender(ctx), E_UNAUTHORIZED);
-        assert!(table::contains(&marketplace.listings, listing_id), E_LISTING_NOT_FOUND);
-
-        let current_time = clock::timestamp_ms(clock);
-        let listing = table::borrow_mut(&mut marketplace.listings, listing_id);
-        
-        // Calculate refund
-        let rental_start = *option::borrow(&listing.rental_start);
-        let days_used = (current_time - rental_start) / DAY_IN_MS + 1; // Round up
-        let days_rented = (expires_at - rental_start) / DAY_IN_MS;
-        let refund_days = days_rented - days_used;
-        let refund_amount = refund_days * listing.price_per_day;
-
-        // Reset listing
-        listing.is_rented = false;
-        listing.renter = option::none();
-        listing.rental_start = option::none();
-        listing.rental_end = option::none();
-
-        // Return original NFT to owner
-        transfer::public_transfer(original_nft, listing.owner);
-
-        // Refund unused days (simplified - in practice, deduct platform fee)
-        if (refund_amount > 0) {
-            let refund_coin = coin::from_balance(
-                balance::split(&mut marketplace.platform_balance, refund_amount),
-                ctx
-            );
-            transfer::public_transfer(refund_coin, renter);
-        };
-
-        object::delete(id);
-
-        event::emit(Returned {
-            listing_id,
-            renter,
-            nft_id: original_id,
-            refund_amount,
-            early_return: true,
+        move_to(admin, MarketplaceData {
+            listings: table::new(),
+            rentals: table::new(),
+            user_rentals: table::new(),
+            listing_counter: 0,
         });
-    }
-
-    // Auto-return expired rental
-    public entry fun auto_return_expired<T: key + store>(
-        marketplace: &mut Marketplace,
-        rental_nft: RentalNFT<T>,
-        clock: &Clock,
-    ) {
-        let RentalNFT {
-            id,
-            original_nft,
-            original_id,
-            expires_at,
-            renter: _,
-            listing_id,
-        } = rental_nft;
-
-        let current_time = clock::timestamp_ms(clock);
-        assert!(current_time >= expires_at, E_RENTAL_NOT_EXPIRED);
-        assert!(table::contains(&marketplace.listings, listing_id), E_LISTING_NOT_FOUND);
-
-        let listing = table::borrow_mut(&mut marketplace.listings, listing_id);
-        let original_owner = listing.owner;
-
-        // Reset listing
-        listing.is_rented = false;
-        listing.renter = option::none();
-        listing.rental_start = option::none();
-        listing.rental_end = option::none();
-
-        // Return original NFT to owner
-        transfer::public_transfer(original_nft, original_owner);
-
-        object::delete(id);
-
-        event::emit(ExpiredAutoReturn {
-            listing_id,
-            original_owner,
-            nft_id: original_id,
-        });
-    }
-
-    // Remove listing
-    public entry fun remove_listing(
-        marketplace: &mut Marketplace,
-        listing_id: ID,
-        ctx: &mut TxContext
-    ) {
-        assert!(!marketplace.paused, E_UNAUTHORIZED);
-        assert!(table::contains(&marketplace.listings, listing_id), E_LISTING_NOT_FOUND);
-        
-        let listing = table::borrow(&marketplace.listings, listing_id);
-        assert!(listing.owner == tx_context::sender(ctx), E_NOT_OWNER);
-        assert!(!listing.is_rented, E_ALREADY_RENTED);
-
-        table::remove(&mut marketplace.listings, listing_id);
     }
 
     // Admin functions
-    public entry fun pause_marketplace(
-        _: &AdminCap,
-        marketplace: &mut Marketplace,
-    ) {
-        marketplace.paused = true;
+    public entry fun pause_marketplace(admin: &signer) acquires MarketplaceConfig {
+        let admin_addr = signer::address_of(admin);
+        assert!(exists<MarketplaceConfig>(admin_addr), E_NOT_INITIALIZED);
+        
+        let config = borrow_global_mut<MarketplaceConfig>(admin_addr);
+        assert!(config.admin == admin_addr, E_UNAUTHORIZED);
+        config.is_paused = true;
     }
 
-    public entry fun unpause_marketplace(
-        _: &AdminCap,
-        marketplace: &mut Marketplace,
-    ) {
-        marketplace.paused = false;
+    public entry fun unpause_marketplace(admin: &signer) acquires MarketplaceConfig {
+        let admin_addr = signer::address_of(admin);
+        assert!(exists<MarketplaceConfig>(admin_addr), E_NOT_INITIALIZED);
+        
+        let config = borrow_global_mut<MarketplaceConfig>(admin_addr);
+        assert!(config.admin == admin_addr, E_UNAUTHORIZED);
+        config.is_paused = false;
     }
 
-    public entry fun update_platform_fee(
-        _: &AdminCap,
-        marketplace: &mut Marketplace,
-        new_fee_bps: u64,
-    ) {
-        marketplace.platform_fee_bps = new_fee_bps;
+    public entry fun update_platform_fee(admin: &signer, new_fee_basis_points: u64) acquires MarketplaceConfig {
+        let admin_addr = signer::address_of(admin);
+        assert!(exists<MarketplaceConfig>(admin_addr), E_NOT_INITIALIZED);
+        
+        let config = borrow_global_mut<MarketplaceConfig>(admin_addr);
+        assert!(config.admin == admin_addr, E_UNAUTHORIZED);
+        config.platform_fee_basis_points = new_fee_basis_points;
     }
 
-    public entry fun withdraw_platform_fees(
-        _: &AdminCap,
-        marketplace: &mut Marketplace,
-        ctx: &mut TxContext
-    ) {
-        let amount = balance::value(&marketplace.platform_balance);
-        if (amount > 0) {
-            let fees = coin::from_balance(
-                balance::split(&mut marketplace.platform_balance, amount),
-                ctx
-            );
-            transfer::public_transfer(fees, marketplace.admin);
-        }
+    // Core marketplace functions
+    public entry fun list_for_rent(
+        owner: &signer,
+        nft_id: String,
+        price_per_day: u64,
+        max_duration_days: u64,
+        collateral_required: u64,
+        marketplace_admin: address,
+    ) acquires MarketplaceConfig, MarketplaceData {
+        let owner_addr = signer::address_of(owner);
+        assert!(exists<MarketplaceConfig>(marketplace_admin), E_NOT_INITIALIZED);
+        
+        let config = borrow_global<MarketplaceConfig>(marketplace_admin);
+        assert!(!config.is_paused, E_PAUSED);
+        assert!(price_per_day > 0, E_INVALID_PRICE);
+        assert!(max_duration_days > 0 && max_duration_days <= MAX_DURATION_DAYS, E_INVALID_DURATION);
+
+        let marketplace_data = borrow_global_mut<MarketplaceData>(marketplace_admin);
+        
+        // Check if NFT is already listed or rented
+        if (table::contains(&marketplace_data.listings, nft_id)) {
+            let existing_listing = table::borrow(&marketplace_data.listings, nft_id);
+            assert!(!existing_listing.is_active, E_ALREADY_RENTED);
+        };
+
+        let listing = Listing {
+            owner: owner_addr,
+            nft_id,
+            price_per_day,
+            max_duration_days,
+            collateral_required,
+            is_active: true,
+            created_at: timestamp::now_seconds(),
+        };
+
+        table::upsert(&mut marketplace_data.listings, nft_id, listing);
+
+        event::emit(ListedEvent {
+            owner: owner_addr,
+            nft_id,
+            price_per_day,
+            max_duration_days,
+            collateral_required,
+            timestamp: timestamp::now_seconds(),
+        });
+    }
+
+    public entry fun rent_nft(
+        renter: &signer,
+        nft_id: String,
+        rental_duration_days: u64,
+        marketplace_admin: address,
+    ) acquires MarketplaceConfig, MarketplaceData {
+        let renter_addr = signer::address_of(renter);
+        assert!(exists<MarketplaceConfig>(marketplace_admin), E_NOT_INITIALIZED);
+        
+        let config = borrow_global<MarketplaceConfig>(marketplace_admin);
+        assert!(!config.is_paused, E_PAUSED);
+
+        let marketplace_data = borrow_global_mut<MarketplaceData>(marketplace_admin);
+        assert!(table::contains(&marketplace_data.listings, nft_id), E_LISTING_NOT_FOUND);
+
+        let listing = table::borrow_mut(&mut marketplace_data.listings, nft_id);
+        assert!(listing.is_active, E_ALREADY_RENTED);
+        assert!(listing.owner != renter_addr, E_CANNOT_RENT_OWN_NFT);
+        assert!(rental_duration_days <= listing.max_duration_days, E_INVALID_DURATION);
+
+        let total_cost = listing.price_per_day * rental_duration_days;
+        let platform_fee = (total_cost * config.platform_fee_basis_points) / 10000;
+        let owner_payment = total_cost - platform_fee;
+        let total_payment = total_cost + listing.collateral_required;
+
+        // Transfer payment from renter
+        coin::transfer<AptosCoin>(renter, listing.owner, owner_payment);
+        if (platform_fee > 0) {
+            coin::transfer<AptosCoin>(renter, config.treasury, platform_fee);
+        };
+        
+        // Hold collateral (transferred to marketplace admin for escrow)
+        if (listing.collateral_required > 0) {
+            coin::transfer<AptosCoin>(renter, marketplace_admin, listing.collateral_required);
+        };
+
+        let rental_start = timestamp::now_seconds();
+        let rental_end = rental_start + (rental_duration_days * SECONDS_PER_DAY);
+
+        // Create rental record
+        let rental = RentalRecord {
+            renter: renter_addr,
+            original_owner: listing.owner,
+            nft_id,
+            rental_start,
+            rental_end,
+            daily_price: listing.price_per_day,
+            total_paid: total_cost,
+            collateral_paid: listing.collateral_required,
+            is_active: true,
+        };
+
+        table::upsert(&mut marketplace_data.rentals, nft_id, rental);
+
+        // Update user rentals tracking
+        if (!table::contains(&marketplace_data.user_rentals, renter_addr)) {
+            table::add(&mut marketplace_data.user_rentals, renter_addr, vector::empty<String>());
+        };
+        let user_rentals = table::borrow_mut(&mut marketplace_data.user_rentals, renter_addr);
+        vector::push_back(user_rentals, nft_id);
+
+        // Mark listing as inactive
+        listing.is_active = false;
+
+        // Create rental capability for the renter
+        move_to(renter, RentalCapability {
+            nft_id,
+            expires_at: rental_end,
+            original_owner: listing.owner,
+        });
+
+        event::emit(RentedEvent {
+            renter: renter_addr,
+            owner: listing.owner,
+            nft_id,
+            rental_duration_days,
+            total_cost,
+            collateral: listing.collateral_required,
+            rental_start,
+            rental_end,
+        });
+    }
+
+    public entry fun return_nft_early(
+        renter: &signer,
+        nft_id: String,
+        marketplace_admin: address,
+    ) acquires MarketplaceConfig, MarketplaceData, RentalCapability {
+        let renter_addr = signer::address_of(renter);
+        assert!(exists<MarketplaceConfig>(marketplace_admin), E_NOT_INITIALIZED);
+        assert!(exists<RentalCapability>(renter_addr), E_RENTAL_NOT_FOUND);
+
+        let config = borrow_global<MarketplaceConfig>(marketplace_admin);
+        let marketplace_data = borrow_global_mut<MarketplaceData>(marketplace_admin);
+        
+        assert!(table::contains(&marketplace_data.rentals, nft_id), E_RENTAL_NOT_FOUND);
+        let rental = table::borrow_mut(&mut marketplace_data.rentals, nft_id);
+        assert!(rental.renter == renter_addr, E_NOT_RENTER);
+        assert!(rental.is_active, E_RENTAL_NOT_FOUND);
+
+        let current_time = timestamp::now_seconds();
+        let days_used = (current_time - rental.rental_start) / SECONDS_PER_DAY + 1; // Round up
+        let days_remaining = ((rental.rental_end - current_time) / SECONDS_PER_DAY);
+        
+        let refund_amount = if (days_remaining > 0) {
+            days_remaining * rental.daily_price
+        } else {
+            0
+        };
+
+        // Process refund
+        if (refund_amount > 0) {
+            coin::transfer<AptosCoin>(&account::create_signer_with_capability(&account::create_test_signer_cap(marketplace_admin)), renter_addr, refund_amount);
+        };
+
+        // Return collateral
+        if (rental.collateral_paid > 0) {
+            coin::transfer<AptosCoin>(&account::create_signer_with_capability(&account::create_test_signer_cap(marketplace_admin)), renter_addr, rental.collateral_paid);
+        };
+
+        // Clean up rental
+        rental.is_active = false;
+        
+        // Reactivate listing
+        let listing = table::borrow_mut(&mut marketplace_data.listings, nft_id);
+        listing.is_active = true;
+
+        // Remove rental capability
+        let RentalCapability { nft_id: _, expires_at: _, original_owner } = move_from<RentalCapability>(renter_addr);
+
+        event::emit(ReturnedEvent {
+            renter: renter_addr,
+            owner: original_owner,
+            nft_id,
+            return_time: current_time,
+            refund_amount,
+            collateral_returned: rental.collateral_paid,
+        });
+    }
+
+    public entry fun claim_expired_nft(
+        owner: &signer,
+        nft_id: String,
+        marketplace_admin: address,
+    ) acquires MarketplaceConfig, MarketplaceData {
+        let owner_addr = signer::address_of(owner);
+        assert!(exists<MarketplaceConfig>(marketplace_admin), E_NOT_INITIALIZED);
+        
+        let marketplace_data = borrow_global_mut<MarketplaceData>(marketplace_admin);
+        assert!(table::contains(&marketplace_data.rentals, nft_id), E_RENTAL_NOT_FOUND);
+        
+        let rental = table::borrow_mut(&mut marketplace_data.rentals, nft_id);
+        assert!(rental.original_owner == owner_addr, E_NOT_OWNER);
+        assert!(rental.is_active, E_RENTAL_NOT_FOUND);
+        
+        let current_time = timestamp::now_seconds();
+        assert!(current_time >= rental.rental_end, E_RENTAL_NOT_FOUND);
+
+        // Mark rental as inactive
+        rental.is_active = false;
+
+        // Reactivate listing
+        let listing = table::borrow_mut(&mut marketplace_data.listings, nft_id);
+        listing.is_active = true;
+
+        event::emit(ExpiredAutoReturnEvent {
+            renter: rental.renter,
+            owner: owner_addr,
+            nft_id,
+            expiry_time: rental.rental_end,
+        });
     }
 
     // View functions
-    public fun get_listing_info(
-        marketplace: &Marketplace,
-        listing_id: ID,
-    ): (address, ID, u64, u64, u64, bool) {
-        let listing = table::borrow(&marketplace.listings, listing_id);
-        (
-            listing.owner,
-            listing.nft_id,
-            listing.price_per_day,
-            listing.max_duration,
-            listing.collateral_required,
-            listing.is_rented
-        )
+    #[view]
+    public fun get_listing(nft_id: String, marketplace_admin: address): (address, u64, u64, u64, bool) acquires MarketplaceData {
+        let marketplace_data = borrow_global<MarketplaceData>(marketplace_admin);
+        assert!(table::contains(&marketplace_data.listings, nft_id), E_LISTING_NOT_FOUND);
+        
+        let listing = table::borrow(&marketplace_data.listings, nft_id);
+        (listing.owner, listing.price_per_day, listing.max_duration_days, listing.collateral_required, listing.is_active)
     }
 
-    public fun get_rental_info<T: key + store>(
-        rental_nft: &RentalNFT<T>
-    ): (ID, u64, address, ID) {
-        (
-            rental_nft.original_id,
-            rental_nft.expires_at,
-            rental_nft.renter,
-            rental_nft.listing_id
-        )
+    #[view]
+    public fun get_rental_info(nft_id: String, marketplace_admin: address): (address, address, u64, u64, bool) acquires MarketplaceData {
+        let marketplace_data = borrow_global<MarketplaceData>(marketplace_admin);
+        assert!(table::contains(&marketplace_data.rentals, nft_id), E_RENTAL_NOT_FOUND);
+        
+        let rental = table::borrow(&marketplace_data.rentals, nft_id);
+        (rental.renter, rental.original_owner, rental.rental_start, rental.rental_end, rental.is_active)
     }
 
-    public fun is_rental_expired<T: key + store>(
-        rental_nft: &RentalNFT<T>,
-        clock: &Clock
-    ): bool {
-        clock::timestamp_ms(clock) >= rental_nft.expires_at
-    }
-
-    public fun marketplace_is_paused(marketplace: &Marketplace): bool {
-        marketplace.paused
-    }
-
-    // Test helpers (for testing only)
-    #[test_only]
-    public fun init_for_testing(ctx: &mut TxContext) {
-        init(ctx);
-    }
-
-    #[test_only]
-    public fun create_test_listing(
-        marketplace: &mut Marketplace,
-        owner: address,
-        nft_id: ID,
-        price_per_day: u64,
-        max_duration: u64,
-        collateral_required: u64,
-        ctx: &mut TxContext
-    ): ID {
-        let listing_id = object::id_from_address(tx_context::fresh_object_address(ctx));
-        let listing = Listing {
-            owner,
-            nft_id,
-            price_per_day,
-            max_duration,
-            collateral_required,
-            is_rented: false,
-            renter: option::none(),
-            rental_start: option::none(),
-            rental_end: option::none(),
+    #[view]
+    public fun is_rental_expired(nft_id: String, marketplace_admin: address): bool acquires MarketplaceData {
+        let marketplace_data = borrow_global<MarketplaceData>(marketplace_admin);
+        if (!table::contains(&marketplace_data.rentals, nft_id)) {
+            return false
         };
-        table::add(&mut marketplace.listings, listing_id, listing);
-        listing_id
-    }
-}
-
-// Wrapper module for rental NFT management
-module rentable::wrapper {
-    use sui::object::{Self, UID, ID};
-    use sui::tx_context::{Self, TxContext};
-    use sui::transfer;
-    use sui::clock::{Self, Clock};
-
-    // Re-export the RentalNFT type for external use
-     use rentable::market::RentalNFT;
-
-    // Utility functions for working with rental NFTs
-    public fun unwrap_if_expired<T: key + store>(
-        rental_nft: RentalNFT<T>,
-        clock: &Clock,
-    ): T {
-        let current_time = clock::timestamp_ms(clock);
-        assert!(current_time >= rentable::market::get_rental_info(&rental_nft).1, 0);
         
-        let RentalNFT {
-            id,
-            original_nft,
-            original_id: _,
-            expires_at: _,
-            renter: _,
-            listing_id: _,
-        } = rental_nft;
-        
-        object::delete(id);
-        original_nft
+        let rental = table::borrow(&marketplace_data.rentals, nft_id);
+        timestamp::now_seconds() >= rental.rental_end
     }
 
-    public fun get_wrapped_nft_id<T: key + store>(rental_nft: &RentalNFT<T>): ID {
-        let (original_id, _, _, _) = rentable::market::get_rental_info(rental_nft);
-        original_id
+    #[view]
+    public fun get_platform_fee(): u64 {
+        PLATFORM_FEE_BASIS_POINTS
     }
 
-    public fun get_expiry_time<T: key + store>(rental_nft: &RentalNFT<T>): u64 {
-        let (_, expires_at, _, _) = rentable::market::get_rental_info(rental_nft);
-        expires_at
-    }
-}
-
-// Admin module for marketplace management
-module rentable::admin {
-    use sui::object::{Self, UID};
-    use sui::tx_context::{Self, TxContext};
-    use sui::transfer;
-
-    // Re-export admin functions
-     use rentable::market::{
-        pause_marketplace,
-        unpause_marketplace,
-        update_platform_fee,
-        withdraw_platform_fees,
-        AdminCap
-    };
-
-    // Additional admin utilities
-    public fun transfer_admin_cap(
-        admin_cap: AdminCap,
-        new_admin: address,
-    ) {
-        transfer::transfer(admin_cap, new_admin);
+    // Helper functions
+    fun calculate_total_cost(price_per_day: u64, duration_days: u64): u64 {
+        price_per_day * duration_days
     }
 
-    public fun create_additional_admin_cap(
-        _: &AdminCap,
-        ctx: &mut TxContext
-    ): AdminCap {
-        AdminCap {
-            id: object::new(ctx),
-        }
+    fun calculate_platform_fee(total_cost: u64, fee_basis_points: u64): u64 {
+        (total_cost * fee_basis_points) / 10000
+    }
+
+    // Test helper functions
+    #[test_only]
+    public fun init_for_test(admin: &signer, treasury: address) {
+        initialize(admin, treasury);
+    }
+
+    #[test_only]
+    public fun get_listing_count(marketplace_admin: address): u64 acquires MarketplaceData {
+        let marketplace_data = borrow_global<MarketplaceData>(marketplace_admin);
+        marketplace_data.listing_counter
     }
 }
