@@ -10,7 +10,7 @@ module addr::FlowStream{
     use aptos_std::table::{Self, Table};
     use aptos_std::type_info;
 
-    // Error codes
+    // Error codes 
     const E_STREAM_NOT_FOUND: u64 = 1;
     const E_UNAUTHORIZED: u64 = 2;
     const E_INVALID_PARAMETERS: u64 = 3;
@@ -20,7 +20,7 @@ module addr::FlowStream{
     const E_ALREADY_WITHDRAWN: u64 = 7;
     const E_INVALID_TIME_RANGE: u64 = 8;
 
-    // Stream status
+    //Stream status
     const STATUS_ACTIVE: u8 = 1;
     const STATUS_PAUSED: u8 = 2;
     const STATUS_CANCELLED: u8 = 3;
