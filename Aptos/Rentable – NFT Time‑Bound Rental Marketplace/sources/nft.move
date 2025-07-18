@@ -1,15 +1,13 @@
 module addr::market {
     use std::signer;
     use std::vector;
-    use std::string::{Self, String};
-    use std::option::{Self, Option};
+    use std::string::String;
     use std::timestamp;
     use std::coin;
     use std::table::{Self, Table};
     use std::event;
     use aptos_framework::account;
     use aptos_framework::aptos_coin::AptosCoin;
-    use aptos_std::math64;
 
     // Error codes
     const E_NOT_INITIALIZED: u64 = 1;
@@ -27,14 +25,15 @@ module addr::market {
     const E_INVALID_COLLATERAL: u64 = 13;
     const E_PAUSED: u64 = 14;
     const E_UNAUTHORIZED: u64 = 15;
+    const E_INSUFFICIENT_BALANCE: u64 = 16;
 
     // Constants
     const SECONDS_PER_DAY: u64 = 86400;
     const PLATFORM_FEE_BASIS_POINTS: u64 = 250; // 2.5%
     const MAX_DURATION_DAYS: u64 = 365;
 
-    // Core structs
-    struct Listing has store {
+    // Core structs - Added drop ability
+    struct Listing has store, drop {
         owner: address,
         nft_id: String,
         price_per_day: u64,
@@ -44,7 +43,7 @@ module addr::market {
         created_at: u64,
     }
 
-    struct RentalRecord has store {
+    struct RentalRecord has store, drop {
         renter: address,
         original_owner: address,
         nft_id: String,
@@ -74,6 +73,11 @@ module addr::market {
         rentals: Table<String, RentalRecord>,
         user_rentals: Table<address, vector<String>>,
         listing_counter: u64,
+    }
+
+    // Resource to hold collateral funds
+    struct CollateralVault has key {
+        vault: coin::Coin<AptosCoin>,
     }
 
     // Events
@@ -135,6 +139,11 @@ module addr::market {
             user_rentals: table::new(),
             listing_counter: 0,
         });
+
+        // Initialize collateral vault
+        move_to(admin, CollateralVault {
+            vault: coin::zero<AptosCoin>(),
+        });
     }
 
     // Admin functions
@@ -175,7 +184,7 @@ module addr::market {
         marketplace_admin: address,
     ) acquires MarketplaceConfig, MarketplaceData {
         let owner_addr = signer::address_of(owner);
-        assert!(exists<MarketplaceConfig>(marketplace_admin), E_NOT_INITIALIZED);
+        assert!(exists<MarketplaceData>(marketplace_admin), E_NOT_INITIALIZED);
         
         let config = borrow_global<MarketplaceConfig>(marketplace_admin);
         assert!(!config.is_paused, E_PAUSED);
@@ -217,7 +226,7 @@ module addr::market {
         nft_id: String,
         rental_duration_days: u64,
         marketplace_admin: address,
-    ) acquires MarketplaceConfig, MarketplaceData {
+    ) acquires MarketplaceConfig, MarketplaceData, CollateralVault {
         let renter_addr = signer::address_of(renter);
         assert!(exists<MarketplaceConfig>(marketplace_admin), E_NOT_INITIALIZED);
         
@@ -235,7 +244,11 @@ module addr::market {
         let total_cost = listing.price_per_day * rental_duration_days;
         let platform_fee = (total_cost * config.platform_fee_basis_points) / 10000;
         let owner_payment = total_cost - platform_fee;
-        let total_payment = total_cost + listing.collateral_required;
+
+        // Check if renter has sufficient balance
+        let renter_balance = coin::balance<AptosCoin>(renter_addr);
+        let required_balance = total_cost + listing.collateral_required;
+        assert!(renter_balance >= required_balance, E_INSUFFICIENT_BALANCE);
 
         // Transfer payment from renter
         coin::transfer<AptosCoin>(renter, listing.owner, owner_payment);
@@ -243,9 +256,11 @@ module addr::market {
             coin::transfer<AptosCoin>(renter, config.treasury, platform_fee);
         };
         
-        // Hold collateral (transferred to marketplace admin for escrow)
+        // Handle collateral - deposit into vault
         if (listing.collateral_required > 0) {
-            coin::transfer<AptosCoin>(renter, marketplace_admin, listing.collateral_required);
+            let collateral_coin = coin::withdraw<AptosCoin>(renter, listing.collateral_required);
+            let vault = borrow_global_mut<CollateralVault>(marketplace_admin);
+            coin::merge(&mut vault.vault, collateral_coin);
         };
 
         let rental_start = timestamp::now_seconds();
@@ -299,12 +314,11 @@ module addr::market {
         renter: &signer,
         nft_id: String,
         marketplace_admin: address,
-    ) acquires MarketplaceConfig, MarketplaceData, RentalCapability {
+    ) acquires MarketplaceData, RentalCapability, CollateralVault {
         let renter_addr = signer::address_of(renter);
-        assert!(exists<MarketplaceConfig>(marketplace_admin), E_NOT_INITIALIZED);
+        assert!(exists<MarketplaceData>(marketplace_admin), E_NOT_INITIALIZED);
         assert!(exists<RentalCapability>(renter_addr), E_RENTAL_NOT_FOUND);
 
-        let config = borrow_global<MarketplaceConfig>(marketplace_admin);
         let marketplace_data = borrow_global_mut<MarketplaceData>(marketplace_admin);
         
         assert!(table::contains(&marketplace_data.rentals, nft_id), E_RENTAL_NOT_FOUND);
@@ -313,8 +327,11 @@ module addr::market {
         assert!(rental.is_active, E_RENTAL_NOT_FOUND);
 
         let current_time = timestamp::now_seconds();
-        let days_used = (current_time - rental.rental_start) / SECONDS_PER_DAY + 1; // Round up
-        let days_remaining = ((rental.rental_end - current_time) / SECONDS_PER_DAY);
+        let days_remaining = if (current_time < rental.rental_end) {
+            (rental.rental_end - current_time) / SECONDS_PER_DAY
+        } else {
+            0
+        };
         
         let refund_amount = if (days_remaining > 0) {
             days_remaining * rental.daily_price
@@ -322,14 +339,13 @@ module addr::market {
             0
         };
 
-        // Process refund
-        if (refund_amount > 0) {
-            coin::transfer<AptosCoin>(&account::create_signer_with_capability(&account::create_test_signer_cap(marketplace_admin)), renter_addr, refund_amount);
-        };
-
-        // Return collateral
-        if (rental.collateral_paid > 0) {
-            coin::transfer<AptosCoin>(&account::create_signer_with_capability(&account::create_test_signer_cap(marketplace_admin)), renter_addr, rental.collateral_paid);
+        // Process refund and return collateral from vault
+        let vault = borrow_global_mut<CollateralVault>(marketplace_admin);
+        let total_return = refund_amount + rental.collateral_paid;
+        
+        if (total_return > 0) {
+            let return_coin = coin::extract(&mut vault.vault, total_return);
+            coin::deposit(renter_addr, return_coin);
         };
 
         // Clean up rental
@@ -356,7 +372,7 @@ module addr::market {
         owner: &signer,
         nft_id: String,
         marketplace_admin: address,
-    ) acquires MarketplaceConfig, MarketplaceData {
+    ) acquires MarketplaceData {
         let owner_addr = signer::address_of(owner);
         assert!(exists<MarketplaceConfig>(marketplace_admin), E_NOT_INITIALIZED);
         
@@ -420,6 +436,12 @@ module addr::market {
         PLATFORM_FEE_BASIS_POINTS
     }
 
+    #[view]
+    public fun get_collateral_vault_balance(marketplace_admin: address): u64 acquires CollateralVault {
+        let vault = borrow_global<CollateralVault>(marketplace_admin);
+        coin::value(&vault.vault)
+    }
+
     // Helper functions
     fun calculate_total_cost(price_per_day: u64, duration_days: u64): u64 {
         price_per_day * duration_days
@@ -429,15 +451,5 @@ module addr::market {
         (total_cost * fee_basis_points) / 10000
     }
 
-    // Test helper functions
-    #[test_only]
-    public fun init_for_test(admin: &signer, treasury: address) {
-        initialize(admin, treasury);
-    }
-
-    #[test_only]
-    public fun get_listing_count(marketplace_admin: address): u64 acquires MarketplaceData {
-        let marketplace_data = borrow_global<MarketplaceData>(marketplace_admin);
-        marketplace_data.listing_counter
-    }
+   
 }
